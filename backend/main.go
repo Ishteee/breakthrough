@@ -9,10 +9,13 @@ import (
 )
 
 func main() {
+	hub := ws.NewHub()
+	go hub.Run()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", health)
 	mux.HandleFunc("GET /hello", greet.Hello)
-	mux.HandleFunc("GET /ws", ws.Echo)
+	mux.HandleFunc("GET /ws", ws.Handler(hub))
 
 	addr := ":8080"
 	log.Printf("listening on %s", addr)
