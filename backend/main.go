@@ -5,12 +5,14 @@ import (
 	"net/http"
 
 	"github.com/Ishteee/breakthrough/backend/greet"
+	"github.com/Ishteee/breakthrough/backend/ws"
 )
 
 func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", health)
 	mux.HandleFunc("GET /hello", greet.Hello)
+	mux.HandleFunc("GET /ws", ws.Echo)
 
 	addr := ":8080"
 	log.Printf("listening on %s", addr)
