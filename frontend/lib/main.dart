@@ -1,13 +1,18 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
+import 'dart:ui';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
+import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:latlong2/latlong.dart';
+import 'package:web_socket_channel/status.dart' as ws_status;
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 const _serverUrl = 'ws://172.25.24.108:8080/ws';
 const _sendInterval = Duration(seconds: 5);
-const _maxContentWidth = 640.0;
 const _seedColor = Color(0xFF6366F1);
 
 void main() {
@@ -60,8 +65,24 @@ class LocationMessage {
       timestamp: json['timestamp'] as int,
     );
   }
+}
 
-  DateTime get time => DateTime.fromMillisecondsSinceEpoch(timestamp);
+class _TrackedUser {
+  _TrackedUser({
+    required this.userID,
+    required this.from,
+    required this.to,
+    required this.updatedAt,
+    required this.color,
+    required this.isSelf,
+  });
+
+  final String userID;
+  LatLng from;
+  LatLng to;
+  DateTime updatedAt;
+  final Color color;
+  final bool isSelf;
 }
 
 class HomePage extends StatefulWidget {
@@ -71,30 +92,65 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
-  final _userIDController = TextEditingController();
+class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
+  final _userIDController = TextEditingController(
+    text: 'user-${math.Random().nextInt(9000) + 1000}',
+  );
+  final _mapController = MapController();
+  final Map<String, _TrackedUser> _users = {};
+
   WebSocketChannel? _channel;
   StreamSubscription? _subscription;
   Timer? _sendTimer;
-  Timer? _uiTicker;
+  late final Ticker _ticker;
   String? _myUserID;
   bool _connected = false;
-  final List<LocationMessage> _messages = [];
+  bool _connecting = false;
+  bool _hasFramed = false;
+  DateTime _now = DateTime.now();
 
   @override
   void initState() {
     super.initState();
-    _uiTicker = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (mounted) setState(() {});
-    });
+    _ticker = createTicker(_onTick)..start();
   }
 
   @override
   void dispose() {
-    _uiTicker?.cancel();
-    _disconnect();
+    _ticker.dispose();
+    _cleanupConnection();
     _userIDController.dispose();
     super.dispose();
+  }
+
+  void _onTick(Duration _) {
+    if (_users.isEmpty) return;
+    final now = DateTime.now();
+    final animating = _users.values.any(
+      (u) => now.difference(u.updatedAt) < _sendInterval,
+    );
+    if (!animating) return;
+    setState(() => _now = now);
+  }
+
+  LatLng _interpolate(_TrackedUser u) {
+    final elapsed = _now.difference(u.updatedAt).inMilliseconds;
+    final total = _sendInterval.inMilliseconds;
+    final t = (elapsed / total).clamp(0.0, 1.0);
+    final eased = Curves.easeInOut.transform(t);
+    return LatLng(
+      lerpDouble(u.from.latitude, u.to.latitude, eased)!,
+      lerpDouble(u.from.longitude, u.to.longitude, eased)!,
+    );
+  }
+
+  Color _colorForUserID(String userID) {
+    var hash = 0;
+    for (final ch in userID.codeUnits) {
+      hash = (hash * 31 + ch) & 0x7fffffff;
+    }
+    final hue = (hash % 360).toDouble();
+    return HSLColor.fromAHSL(1.0, hue, 0.65, 0.52).toColor();
   }
 
   Future<void> _connect() async {
@@ -104,8 +160,11 @@ class _HomePageState extends State<HomePage> {
       return;
     }
 
+    setState(() => _connecting = true);
+
     final serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
+      setState(() => _connecting = false);
       _snack('Turn on location services');
       return;
     }
@@ -116,6 +175,7 @@ class _HomePageState extends State<HomePage> {
     }
     if (permission == LocationPermission.denied ||
         permission == LocationPermission.deniedForever) {
+      setState(() => _connecting = false);
       _snack('Location permission denied');
       return;
     }
@@ -130,9 +190,13 @@ class _HomePageState extends State<HomePage> {
         onError: (_) => _onDisconnected('Connection error'),
         onDone: () => _onDisconnected('Disconnected'),
       );
-      setState(() => _connected = true);
+      setState(() {
+        _connected = true;
+        _connecting = false;
+      });
       _startSending();
     } catch (_) {
+      setState(() => _connecting = false);
       _snack('Failed to connect');
     }
   }
@@ -154,12 +218,11 @@ class _HomePageState extends State<HomePage> {
           timeLimit: Duration(seconds: 10),
         ),
       );
-      final payload = jsonEncode({
+      channel.sink.add(jsonEncode({
         'userID': userID,
         'lat': pos.latitude,
         'lng': pos.longitude,
-      });
-      channel.sink.add(payload);
+      }));
     } catch (_) {}
   }
 
@@ -167,27 +230,83 @@ class _HomePageState extends State<HomePage> {
     try {
       final json = jsonDecode(data as String) as Map<String, dynamic>;
       final msg = LocationMessage.fromJson(json);
-      setState(() {
-        _messages.insert(0, msg);
-        if (_messages.length > 100) _messages.removeLast();
-      });
+      final newPos = LatLng(msg.lat, msg.lng);
+      final now = DateTime.now();
+      final existing = _users[msg.userID];
+      if (existing != null) {
+        final currentPos = _interpolate(existing);
+        existing
+          ..from = currentPos
+          ..to = newPos
+          ..updatedAt = now;
+      } else {
+        _users[msg.userID] = _TrackedUser(
+          userID: msg.userID,
+          from: newPos,
+          to: newPos,
+          updatedAt: now,
+          color: _colorForUserID(msg.userID),
+          isSelf: msg.userID == _myUserID,
+        );
+      }
+      setState(() => _now = now);
+
+      if (!_hasFramed && msg.userID == _myUserID) {
+        _hasFramed = true;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _mapController.move(newPos, 16);
+        });
+      }
     } catch (_) {}
   }
 
   void _onDisconnected(String reason) {
-    _disconnect();
-    _snack(reason);
+    if (!_connected) return;
+    _cleanupConnection();
+    if (mounted) {
+      setState(() {
+        _connected = false;
+        _users.clear();
+        _hasFramed = false;
+      });
+      _snack(reason);
+    }
   }
 
   void _disconnect() {
+    _cleanupConnection();
+    if (mounted) {
+      setState(() {
+        _connected = false;
+        _users.clear();
+        _hasFramed = false;
+      });
+    }
+  }
+
+  void _cleanupConnection() {
     _sendTimer?.cancel();
     _sendTimer = null;
     _subscription?.cancel();
     _subscription = null;
-    _channel?.sink.close();
+    _channel?.sink.close(ws_status.normalClosure);
     _channel = null;
     _myUserID = null;
-    if (mounted) setState(() => _connected = false);
+  }
+
+  void _fitAll() {
+    if (_users.isEmpty) return;
+    final points = _users.values.map(_interpolate).toList();
+    if (points.length == 1) {
+      _mapController.move(points.first, 16);
+      return;
+    }
+    _mapController.fitCamera(
+      CameraFit.bounds(
+        bounds: LatLngBounds.fromPoints(points),
+        padding: const EdgeInsets.fromLTRB(60, 200, 60, 140),
+      ),
+    );
   }
 
   void _snack(String text) {
@@ -197,8 +316,9 @@ class _HomePageState extends State<HomePage> {
         content: Text(text),
         behavior: SnackBarBehavior.floating,
         margin: const EdgeInsets.all(16),
-        shape:
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+        ),
         duration: const Duration(seconds: 2),
       ),
     );
@@ -206,267 +326,460 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final users = _users.values.toList();
+
     return Scaffold(
-      body: SafeArea(
-        child: Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: _maxContentWidth),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                const _Header(),
-                _StatusCard(
-                  connected: _connected,
-                  userID: _myUserID,
-                  messageCount: _messages.length,
-                ),
-                _ControlsCard(
-                  connected: _connected,
-                  controller: _userIDController,
-                  onConnect: _connect,
-                  onDisconnect: _disconnect,
-                ),
-                const SizedBox(height: 4),
-                Expanded(child: _messageList()),
-              ],
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          _MapLayer(
+            mapController: _mapController,
+            users: users,
+            interpolator: _interpolate,
+          ),
+          if (!_connected)
+            IgnorePointer(
+              child: Container(color: cs.surface.withValues(alpha: 0.15)),
             ),
+          SafeArea(
+            child: Align(
+              alignment: Alignment.topCenter,
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 640),
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: _TopPanel(
+                    connected: _connected,
+                    connecting: _connecting,
+                    userIDController: _userIDController,
+                    myUserID: _myUserID,
+                    userCount: _users.length,
+                    onConnect: _connect,
+                    onDisconnect: _disconnect,
+                  ),
+                ),
+              ),
+            ),
+          ),
+          if (_connected)
+            SafeArea(
+              child: Align(
+                alignment: Alignment.bottomRight,
+                child: Padding(
+                  padding: const EdgeInsets.only(right: 16, bottom: 20),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (users.isNotEmpty)
+                        _RoundIconButton(
+                          icon: Icons.center_focus_strong_rounded,
+                          tooltip: 'Fit all',
+                          onPressed: _fitAll,
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          if (_connected && users.isEmpty)
+            const IgnorePointer(
+              child: Align(
+                alignment: Alignment.center,
+                child: _WaitingPill(),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _MapLayer extends StatelessWidget {
+  const _MapLayer({
+    required this.mapController,
+    required this.users,
+    required this.interpolator,
+  });
+
+  final MapController mapController;
+  final List<_TrackedUser> users;
+  final LatLng Function(_TrackedUser) interpolator;
+
+  @override
+  Widget build(BuildContext context) {
+    return FlutterMap(
+      mapController: mapController,
+      options: MapOptions(
+        initialCenter: const LatLng(20, 0),
+        initialZoom: 2,
+        minZoom: 2,
+        maxZoom: 19,
+        interactionOptions: const InteractionOptions(
+          flags: InteractiveFlag.all & ~InteractiveFlag.rotate,
+        ),
+      ),
+      children: [
+        TileLayer(
+          urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+          userAgentPackageName: 'com.example.breakthrough',
+          maxZoom: 19,
+          retinaMode: RetinaMode.isHighDensity(context),
+        ),
+        MarkerLayer(
+          markers: [
+            for (final u in users)
+              Marker(
+                point: interpolator(u),
+                width: 56,
+                height: 56,
+                alignment: Alignment.center,
+                child: _UserMarker(
+                  userID: u.userID,
+                  color: u.color,
+                  isSelf: u.isSelf,
+                ),
+              ),
+          ],
+        ),
+      ],
+    );
+  }
+}
+
+class _UserMarker extends StatefulWidget {
+  const _UserMarker({
+    required this.userID,
+    required this.color,
+    required this.isSelf,
+  });
+
+  final String userID;
+  final Color color;
+  final bool isSelf;
+
+  @override
+  State<_UserMarker> createState() => _UserMarkerState();
+}
+
+class _UserMarkerState extends State<_UserMarker>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _pulse;
+
+  @override
+  void initState() {
+    super.initState();
+    _pulse = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1600),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _pulse.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final initial = widget.userID.isEmpty
+        ? '?'
+        : widget.userID.substring(0, 1).toUpperCase();
+    return Tooltip(
+      message: widget.userID,
+      preferBelow: false,
+      child: SizedBox(
+        width: 56,
+        height: 56,
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            AnimatedBuilder(
+              animation: _pulse,
+              builder: (_, _) {
+                final t = _pulse.value;
+                final size = 24 + t * 28;
+                return Container(
+                  width: size,
+                  height: size,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: widget.color
+                        .withValues(alpha: (1 - t) * (widget.isSelf ? 0.45 : 0.25)),
+                  ),
+                );
+              },
+            ),
+            Container(
+              width: 30,
+              height: 30,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [
+                    widget.color,
+                    HSLColor.fromColor(widget.color)
+                        .withLightness(
+                          (HSLColor.fromColor(widget.color).lightness - 0.12)
+                              .clamp(0.0, 1.0),
+                        )
+                        .toColor(),
+                  ],
+                ),
+                border: Border.all(color: Colors.white, width: 2.5),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.25),
+                    blurRadius: 8,
+                    offset: const Offset(0, 2),
+                  ),
+                ],
+              ),
+              alignment: Alignment.center,
+              child: Text(
+                initial,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _TopPanel extends StatelessWidget {
+  const _TopPanel({
+    required this.connected,
+    required this.connecting,
+    required this.userIDController,
+    required this.myUserID,
+    required this.userCount,
+    required this.onConnect,
+    required this.onDisconnect,
+  });
+
+  final bool connected;
+  final bool connecting;
+  final TextEditingController userIDController;
+  final String? myUserID;
+  final int userCount;
+  final VoidCallback onConnect;
+  final VoidCallback onDisconnect;
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(22),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+        child: Container(
+          decoration: BoxDecoration(
+            color: cs.surface.withValues(alpha: 0.82),
+            borderRadius: BorderRadius.circular(22),
+            border: Border.all(
+              color: cs.outlineVariant.withValues(alpha: 0.5),
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.08),
+                blurRadius: 24,
+                offset: const Offset(0, 8),
+              ),
+            ],
+          ),
+          padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  _LogoMark(),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          'Breakthrough',
+                          style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                                fontWeight: FontWeight.w700,
+                                letterSpacing: -0.2,
+                              ),
+                        ),
+                        const SizedBox(height: 2),
+                        _StatusChip(
+                          connected: connected,
+                          myUserID: myUserID,
+                          count: userCount,
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (connected)
+                    IconButton.filledTonal(
+                      onPressed: onDisconnect,
+                      tooltip: 'Disconnect',
+                      icon: const Icon(Icons.logout_rounded),
+                    ),
+                ],
+              ),
+              if (!connected) ...[
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: userIDController,
+                        enabled: !connecting,
+                        textInputAction: TextInputAction.done,
+                        onSubmitted: (_) => onConnect(),
+                        decoration: InputDecoration(
+                          hintText: 'Your name',
+                          prefixIcon:
+                              const Icon(Icons.person_rounded, size: 20),
+                          filled: true,
+                          fillColor: cs.surfaceContainerHighest,
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide: BorderSide.none,
+                          ),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide: BorderSide.none,
+                          ),
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 14,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton.icon(
+                      onPressed: connecting ? null : onConnect,
+                      icon: connecting
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
+                          : const Icon(Icons.bolt_rounded),
+                      label: Text(connecting ? 'Connecting' : 'Connect'),
+                      style: FilledButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 18,
+                          vertical: 14,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ],
           ),
         ),
       ),
     );
   }
-
-  Widget _messageList() {
-    if (_messages.isEmpty) {
-      return _EmptyState(connected: _connected);
-    }
-    return ListView.builder(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
-      itemCount: _messages.length,
-      itemBuilder: (ctx, i) {
-        final m = _messages[i];
-        return _LocationCard(message: m, isMe: m.userID == _myUserID);
-      },
-    );
-  }
 }
 
-class _Header extends StatelessWidget {
-  const _Header();
-
+class _LogoMark extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 20, 20, 12),
-      child: Row(
-        children: [
-          Container(
-            width: 46,
-            height: 46,
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                colors: [
-                  theme.colorScheme.primary,
-                  theme.colorScheme.tertiary,
-                ],
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-              ),
-              borderRadius: BorderRadius.circular(14),
-              boxShadow: [
-                BoxShadow(
-                  color: theme.colorScheme.primary.withValues(alpha: 0.25),
-                  blurRadius: 14,
-                  offset: const Offset(0, 6),
-                ),
-              ],
-            ),
-            child: const Icon(Icons.explore_rounded,
-                color: Colors.white, size: 24),
-          ),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'Breakthrough',
-                  style: theme.textTheme.titleLarge?.copyWith(
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: -0.3,
-                  ),
-                ),
-                Text(
-                  'Share your location with friends',
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
-              ],
-            ),
+    final cs = Theme.of(context).colorScheme;
+    return Container(
+      width: 40,
+      height: 40,
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [cs.primary, cs.tertiary],
+        ),
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [
+          BoxShadow(
+            color: cs.primary.withValues(alpha: 0.3),
+            blurRadius: 12,
+            offset: const Offset(0, 4),
           ),
         ],
       ),
+      child: const Icon(
+        Icons.travel_explore_rounded,
+        color: Colors.white,
+        size: 22,
+      ),
     );
   }
 }
 
-class _StatusCard extends StatelessWidget {
-  final bool connected;
-  final String? userID;
-  final int messageCount;
-
-  const _StatusCard({
+class _StatusChip extends StatelessWidget {
+  const _StatusChip({
     required this.connected,
-    required this.userID,
-    required this.messageCount,
+    required this.myUserID,
+    required this.count,
   });
+
+  final bool connected;
+  final String? myUserID;
+  final int count;
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final color = connected
-        ? const Color(0xFF16A34A)
-        : theme.colorScheme.error;
-    return Container(
-      margin: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.08),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: color.withValues(alpha: 0.25)),
-      ),
-      child: Row(
-        children: [
-          _PulseDot(color: color, active: connected),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              connected ? 'Connected as $userID' : 'Not connected',
-              style: theme.textTheme.bodyMedium?.copyWith(
-                fontWeight: FontWeight.w600,
-              ),
+    final cs = Theme.of(context).colorScheme;
+    final dot = connected ? const Color(0xFF22C55E) : cs.outline;
+    final label = connected
+        ? '$count on the map · you are $myUserID'
+        : 'Not connected';
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _LivePulse(color: dot, active: connected),
+        const SizedBox(width: 6),
+        Flexible(
+          child: Text(
+            label,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: 12,
+              color: cs.onSurfaceVariant,
+              fontWeight: FontWeight.w500,
             ),
           ),
-          if (connected)
-            Container(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-              decoration: BoxDecoration(
-                color: color.withValues(alpha: 0.12),
-                borderRadius: BorderRadius.circular(999),
-              ),
-              child: Text(
-                '$messageCount',
-                style: theme.textTheme.labelSmall?.copyWith(
-                  color: color,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ),
-        ],
-      ),
+        ),
+      ],
     );
   }
 }
 
-class _ControlsCard extends StatelessWidget {
-  final bool connected;
-  final TextEditingController controller;
-  final VoidCallback onConnect;
-  final VoidCallback onDisconnect;
+class _LivePulse extends StatefulWidget {
+  const _LivePulse({required this.color, required this.active});
 
-  const _ControlsCard({
-    required this.connected,
-    required this.controller,
-    required this.onConnect,
-    required this.onDisconnect,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: theme.colorScheme.surface,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: theme.colorScheme.outlineVariant),
-      ),
-      child: connected
-          ? SizedBox(
-              width: double.infinity,
-              child: FilledButton.tonalIcon(
-                onPressed: onDisconnect,
-                icon: const Icon(Icons.logout_rounded),
-                label: const Text('Disconnect'),
-                style: FilledButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(vertical: 14),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-              ),
-            )
-          : Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: controller,
-                    textInputAction: TextInputAction.done,
-                    onSubmitted: (_) => onConnect(),
-                    decoration: InputDecoration(
-                      hintText: 'Your name',
-                      prefixIcon:
-                          const Icon(Icons.person_rounded, size: 20),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide.none,
-                      ),
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide.none,
-                      ),
-                      filled: true,
-                      fillColor: theme.colorScheme.surfaceContainerHighest,
-                      contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 14),
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                FilledButton(
-                  onPressed: onConnect,
-                  style: FilledButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 22, vertical: 14),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                  ),
-                  child: const Text(
-                    'Connect',
-                    style: TextStyle(fontWeight: FontWeight.w600),
-                  ),
-                ),
-              ],
-            ),
-    );
-  }
-}
-
-class _PulseDot extends StatefulWidget {
   final Color color;
   final bool active;
-  const _PulseDot({required this.color, required this.active});
 
   @override
-  State<_PulseDot> createState() => _PulseDotState();
+  State<_LivePulse> createState() => _LivePulseState();
 }
 
-class _PulseDotState extends State<_PulseDot>
+class _LivePulseState extends State<_LivePulse>
     with SingleTickerProviderStateMixin {
   late final AnimationController _ctrl;
 
@@ -489,8 +802,8 @@ class _PulseDotState extends State<_PulseDot>
   Widget build(BuildContext context) {
     if (!widget.active) {
       return Container(
-        width: 10,
-        height: 10,
+        width: 8,
+        height: 8,
         decoration: BoxDecoration(
           shape: BoxShape.circle,
           color: widget.color,
@@ -498,8 +811,8 @@ class _PulseDotState extends State<_PulseDot>
       );
     }
     return SizedBox(
-      width: 22,
-      height: 22,
+      width: 16,
+      height: 16,
       child: AnimatedBuilder(
         animation: _ctrl,
         builder: (_, _) {
@@ -508,16 +821,16 @@ class _PulseDotState extends State<_PulseDot>
             alignment: Alignment.center,
             children: [
               Container(
-                width: 22 * (0.45 + 0.55 * t),
-                height: 22 * (0.45 + 0.55 * t),
+                width: 8 + t * 8,
+                height: 8 + t * 8,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  color: widget.color.withValues(alpha: (1 - t) * 0.45),
+                  color: widget.color.withValues(alpha: (1 - t) * 0.5),
                 ),
               ),
               Container(
-                width: 10,
-                height: 10,
+                width: 8,
+                height: 8,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
                   color: widget.color,
@@ -531,178 +844,89 @@ class _PulseDotState extends State<_PulseDot>
   }
 }
 
-class _EmptyState extends StatelessWidget {
-  final bool connected;
-  const _EmptyState({required this.connected});
+class _RoundIconButton extends StatelessWidget {
+  const _RoundIconButton({
+    required this.icon,
+    required this.tooltip,
+    required this.onPressed,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onPressed;
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(32),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              padding: const EdgeInsets.all(22),
-              decoration: BoxDecoration(
-                color: theme.colorScheme.primaryContainer,
-                shape: BoxShape.circle,
-              ),
-              child: Icon(
-                connected
-                    ? Icons.location_searching_rounded
-                    : Icons.wifi_tethering_off_rounded,
-                size: 38,
-                color: theme.colorScheme.onPrimaryContainer,
-              ),
-            ),
-            const SizedBox(height: 20),
-            Text(
-              connected
-                  ? 'Waiting for the first ping'
-                  : 'You are not connected',
-              style: theme.textTheme.titleMedium?.copyWith(
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-            const SizedBox(height: 6),
-            Text(
-              connected
-                  ? 'Your location will appear here as soon as it is sent.'
-                  : 'Enter your name and tap Connect to start sharing.',
-              textAlign: TextAlign.center,
-              style: theme.textTheme.bodyMedium?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
-            ),
-          ],
+    final cs = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        elevation: 4,
+        shadowColor: Colors.black.withValues(alpha: 0.2),
+        color: cs.surface,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+          side: BorderSide(
+            color: cs.outlineVariant.withValues(alpha: 0.5),
+          ),
+        ),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(16),
+          onTap: onPressed,
+          child: SizedBox(
+            width: 52,
+            height: 52,
+            child: Icon(icon, color: cs.primary),
+          ),
         ),
       ),
     );
   }
 }
 
-class _LocationCard extends StatelessWidget {
-  final LocationMessage message;
-  final bool isMe;
-  const _LocationCard({required this.message, required this.isMe});
+class _WaitingPill extends StatelessWidget {
+  const _WaitingPill();
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final initial = message.userID.isEmpty
-        ? '?'
-        : message.userID.substring(0, 1).toUpperCase();
-    final accent =
-        isMe ? theme.colorScheme.primary : theme.colorScheme.tertiary;
-    return Container(
-      margin: const EdgeInsets.only(bottom: 10),
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: theme.colorScheme.surface,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-          color: isMe
-              ? theme.colorScheme.primary.withValues(alpha: 0.35)
-              : theme.colorScheme.outlineVariant,
+    final cs = Theme.of(context).colorScheme;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(999),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+          decoration: BoxDecoration(
+            color: cs.surface.withValues(alpha: 0.85),
+            borderRadius: BorderRadius.circular(999),
+            border: Border.all(
+              color: cs.outlineVariant.withValues(alpha: 0.5),
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 14,
+                height: 14,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: cs.primary,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Text(
+                'Waiting for the first ping',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: cs.onSurface,
+                ),
+              ),
+            ],
+          ),
         ),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.03),
-            blurRadius: 8,
-            offset: const Offset(0, 2),
-          ),
-        ],
-      ),
-      child: Row(
-        children: [
-          Container(
-            width: 46,
-            height: 46,
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                colors: [accent, accent.withValues(alpha: 0.7)],
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-              ),
-              borderRadius: BorderRadius.circular(14),
-            ),
-            alignment: Alignment.center,
-            child: Text(
-              initial,
-              style: const TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.w700,
-                fontSize: 18,
-              ),
-            ),
-          ),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Flexible(
-                      child: Text(
-                        message.userID,
-                        style: theme.textTheme.titleSmall?.copyWith(
-                          fontWeight: FontWeight.w700,
-                        ),
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    if (isMe) ...[
-                      const SizedBox(width: 6),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 8, vertical: 2),
-                        decoration: BoxDecoration(
-                          color: theme.colorScheme.primaryContainer,
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: Text(
-                          'you',
-                          style: theme.textTheme.labelSmall?.copyWith(
-                            color: theme.colorScheme.onPrimaryContainer,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  '${message.lat.toStringAsFixed(5)}, ${message.lng.toStringAsFixed(5)}',
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 8),
-          Text(
-            _relativeTime(message.time),
-            style: theme.textTheme.labelSmall?.copyWith(
-              color: theme.colorScheme.onSurfaceVariant,
-              fontWeight: FontWeight.w500,
-            ),
-          ),
-        ],
       ),
     );
   }
-}
-
-String _relativeTime(DateTime t) {
-  final diff = DateTime.now().difference(t);
-  if (diff.inSeconds < 5) return 'just now';
-  if (diff.inMinutes < 1) return '${diff.inSeconds}s ago';
-  if (diff.inHours < 1) return '${diff.inMinutes}m ago';
-  return '${diff.inHours}h ago';
 }
